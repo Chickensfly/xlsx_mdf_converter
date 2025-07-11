@@ -219,14 +219,12 @@ def threaded_merge(jobs):
     def prepare_progress():
         task_btn_frame.pack_forget()
         convert_btn.pack_forget()
-        # separate_box.pack_forget()
         progress.pack()
         progress.start(10)
     
     def show_results():
         progress.stop()
         progress.pack_forget()
-        # separate_box.pack()
         task_btn_frame.pack(pady=10)
         convert_btn.pack(pady=10)
         results = ""
@@ -311,10 +309,6 @@ label_frame.pack(fill='both', expand=True, pady=(0, 10), padx=20)
 
 jobs_label = ttk.Label(label_frame, text="No tasks queued", font=("Segoe UI", 9), foreground="gray")
 jobs_label.pack(pady=(5, 0))
-
-# separate_checked = tk.BooleanVar(value=False)
-# separate_box = Checkbutton(main_frame, text="Merge Multiple XLSM Files", variable=separate_checked, background="#dadada", font=("Segoe UI", 9))
-# separate_box.pack(pady=5)
 
 task_btn_frame = ttk.Frame(main_frame)
 task_btn_frame.pack(pady=10)
