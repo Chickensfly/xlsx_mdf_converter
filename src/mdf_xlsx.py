@@ -5,6 +5,8 @@ import threading
 import pandas as pd
 import numpy as np
 import time
+import shutil
+import tempfile
 
 from openpyxl import load_workbook
 from asammdf import MDF, Signal
@@ -65,8 +67,17 @@ def update_jobs_label():
 
 @timing
 def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
+    # Check available sheets
+    xl = pd.ExcelFile(xlsm_path, engine='openpyxl')
+    if 'Uniplot' in xl.sheet_names:
+        sheet_to_read = 'Uniplot'
+    elif '10 Hz Data' in xl.sheet_names:
+        sheet_to_read = '10 Hz Data'
+    else:
+        raise ValueError("Neither 'Uniplot' nor '10 Hz Data' sheet found in the Excel file.")
+
     # Step 1: Read only the header
-    header_df = pd.read_excel(xlsm_path, sheet_name='Uniplot', nrows=0, engine='openpyxl')
+    header_df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, nrows=0, engine='openpyxl')
     excel_columns = list(header_df.columns)
 
     # Step 2: Compare with MF4 channels if provided 
@@ -77,21 +88,21 @@ def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
         needed_columns = excel_columns
 
     # Step 3: Read only needed columns
-    df = pd.read_excel(xlsm_path, sheet_name='Uniplot', usecols=needed_columns, engine='openpyxl')
+    df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, usecols=needed_columns, engine='openpyxl')
     variable_names = [str(v) if pd.notnull(v) else '' for v in list(df.columns)]
     units = [str(u) if pd.notnull(u) else '' for u in df.iloc[0].tolist()]
     df_data = df.iloc[1:].reset_index(drop=True)
     df_data.columns = variable_names
 
     if 'Test Time' not in variable_names:
-        raise ValueError("The 'Uniplot' sheet must contain a 'Test Time' column.")
+        raise ValueError(f"The '{sheet_to_read}' sheet must contain a 'Test Time' column.")
 
     # Convert all columns except 'Test Time' to numeric
     for col in df_data.columns:
         if col != 'Test Time':
             df_data[col] = pd.to_numeric(df_data[col], errors='coerce')
 
-    # Remove columns that are all NaN (except 'Time')
+    # Remove columns that are all NaN (except 'Test Time')
     keep_cols = []
     keep_units = []
     for idx, col in enumerate(variable_names):
@@ -102,7 +113,7 @@ def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
             keep_cols.append(col)
             keep_units.append(units[idx])
     df_data = df_data[keep_cols]
-    print('xlsm read ', df_data.shape)
+    print(f'{sheet_to_read} read ', df_data.shape)
     return df_data, keep_cols, keep_units
 
 # Reads the xlsm file and extracts the 'Cumulatives' sheet, saving it as a new Excel file; throws error if the sheet is missing
@@ -161,18 +172,53 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None):
         excel_speed_norm = (excel_speed - np.mean(excel_speed)) / np.std(excel_speed)
         mf4_speed_norm = (mf4_speed - np.mean(mf4_speed)) / np.std(mf4_speed)
 
-        # Cross-correlate (allow for Excel at end of MF4)
+        # Cross-correlate (allow for any overlap)
         correlation = np.correlate(mf4_speed_norm, excel_speed_norm, mode='full')
-        lag = np.argmax(correlation) - (len(excel_speed_norm) - 1)
+        lags = np.arange(-len(excel_speed_norm) + 1, len(mf4_speed_norm))
 
-        # Find MF4 time at alignment point
-        if lag >= 0 and lag < len(mf4_time):
+        # Only consider lags where the aligned Excel time overlaps with MF4 time
+        valid_lags = []
+        for i, lag in enumerate(lags):
+            # Calculate the time offset for this lag
+            if lag >= 0:
+                mf4_time_at_lag = mf4_time[lag]
+                excel_time_at_zero = excel_time[0]
+                time_offset = excel_time_at_zero - mf4_time_at_lag
+                # Excel shifted left, must not start before MF4
+                if (excel_time[0] - time_offset) < mf4_time[0]:
+                    continue
+                # Excel shifted right, must not end after MF4
+                if (excel_time[-1] - time_offset) > mf4_time[-1]:
+                    continue
+            else:
+                mf4_time_at_lag = mf4_time[0]
+                excel_time_at_zero = excel_time[-lag]
+                time_offset = excel_time_at_zero - mf4_time_at_lag
+                # Excel shifted left, must not start before MF4
+                if (excel_time[0] - time_offset) < mf4_time[0]:
+                    continue
+                # Excel shifted right, must not end after MF4
+                if (excel_time[-1] - time_offset) > mf4_time[-1]:
+                    continue
+            # Overlap check passed
+            valid_lags.append(i)
+
+        if not valid_lags:
+            raise ValueError("No sufficient overlap between MF4 and Excel engine speed signals.")
+
+        # Find the best lag within valid lags
+        best_idx = valid_lags[np.argmax(correlation[valid_lags])]
+        lag = lags[best_idx]
+
+        # Calculate alignment
+        if lag >= 0:
             mf4_time_at_lag = mf4_time[lag]
+            excel_time_at_zero = excel_time[0]
+            time_offset = excel_time_at_zero - mf4_time_at_lag
         else:
-            # If lag is negative or out of bounds, align to end
-            mf4_time_at_lag = mf4_time[-1]
-        excel_time_at_zero = excel_time[0]
-        time_offset = excel_time_at_zero - mf4_time_at_lag
+            mf4_time_at_lag = mf4_time[0]
+            excel_time_at_zero = excel_time[-lag]
+            time_offset = excel_time_at_zero - mf4_time_at_lag
 
         # Now, align Excel signals to MF4 time base
         for idx, col in enumerate(variable_names):
@@ -236,9 +282,13 @@ def threaded_merge(jobs):
         if errors:
             results += "\nFailed Tasks:\n"
             for error, xlsm_path in errors:
-                if isinstance(xlsm_path, tuple):
-                    xlsm_path = xlsm_path[0] + "\n" + xlsm_path[1]
-                results += f"Error: {error}\nExcel File: {os.path.basename(xlsm_path)}\n"
+                # ...existing code...
+                if isinstance(xlsm_path, (list, tuple)):
+                    excel_files = ", ".join(os.path.basename(x) for x in xlsm_path)
+                else:
+                    excel_files = os.path.basename(xlsm_path)
+                results += f"Error: {error}\nExcel File: {excel_files}\n"
+                # ...existing code...
         messagebox.showinfo("Results", results)
         jobs_label.config(text="No tasks queued")
 
@@ -268,8 +318,15 @@ root.title("MF4 + Excel Merge and Convert")
 root.geometry("400x600")
 root.resizable(False, True)
 
-icon_path = resource_path("icons/dumarey_favicon.ico")
-root.iconbitmap(icon_path)
+icon_path = resource_path(os.path.join("icons", "dumarey_favicon.ico"))
+
+# Fix for PyInstaller: extract icon to temp file if running as executable
+if hasattr(sys, '_MEIPASS'):
+    temp_icon = tempfile.NamedTemporaryFile(delete=False, suffix='.ico')
+    shutil.copyfile(icon_path, temp_icon.name)
+    root.iconbitmap(temp_icon.name)
+else:
+    root.iconbitmap(icon_path)
 
 style = ttk.Style(root)
 style.theme_use('default')
@@ -296,13 +353,6 @@ desc_label = ttk.Label(
     style="Main.TLabel"
 )
 desc_label.pack(pady=(0, 20))
-
-advisory_label = ttk.Label(
-    main_frame,
-    text = "Excel files must have a \"Uniplot\" sheet with\n"
-    "the first two rows as variables and units."
-)
-advisory_label.pack(pady=(0, 10))
 
 label_frame = ttk.LabelFrame(main_frame, text="Queued Tasks")
 label_frame.pack(fill='both', expand=True, pady=(0, 10), padx=20)

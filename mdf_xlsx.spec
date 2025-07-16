@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\mdf_xlsx.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('icons/dumarey_favicon.ico', 'icons')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
