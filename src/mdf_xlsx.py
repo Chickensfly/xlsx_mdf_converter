@@ -11,10 +11,9 @@ import tempfile
 from openpyxl import load_workbook
 from asammdf import MDF, Signal
 from tkinter import Checkbutton, ttk, filedialog, messagebox
-
+from python_calamine.pandas import pandas_monkeypatch
 
 def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
     # PyInstaller creates a temp folder and stores path in _MEIPASS
     if hasattr(sys, '_MEIPASS'):
         base_path = sys._MEIPASS
@@ -22,9 +21,10 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-
+# List to hold jobs for processing
 jobs = []
 
+# For debugging and optimization, define a decorator to time functions
 def timing(func):
     def wrapper(*args, **kwargs):
         start = time.time()
@@ -63,12 +63,14 @@ def update_jobs_label():
             update_text += f"   MF4: {os.path.basename(mf4_path)}\n"
         for idx, xlsm_path in enumerate(xlsm_paths):
             update_text += f"   Excel {idx+1}: {os.path.basename(xlsm_path)}\n"
+    if not update_text:
+        update_text = "No tasks queued"
     jobs_label.config(text=update_text)
 
 @timing
 def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
     # Check available sheets
-    xl = pd.ExcelFile(xlsm_path, engine='openpyxl')
+    xl = pd.ExcelFile(xlsm_path, engine='calamine')
     if 'Uniplot' in xl.sheet_names:
         sheet_to_read = 'Uniplot'
     elif '10 Hz Data' in xl.sheet_names:
@@ -77,18 +79,18 @@ def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
         raise ValueError("Neither 'Uniplot' nor '10 Hz Data' sheet found in the Excel file.")
 
     # Step 1: Read only the header
-    header_df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, nrows=0, engine='openpyxl')
+    header_df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, nrows=0, engine='calamine')
     excel_columns = list(header_df.columns)
 
     # Step 2: Compare with MF4 channels if provided 
     if mdf_orig is not None:
         mf4_channels = set(mdf_orig.channels_db.keys())
-        needed_columns = [col for col in excel_columns if col not in mf4_channels or col == 'Test Time']
+        needed_columns = [col for col in excel_columns if col not in mf4_channels or col.lower() == 'test time']
     else:
         needed_columns = excel_columns
 
     # Step 3: Read only needed columns
-    df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, usecols=needed_columns, engine='openpyxl')
+    df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, usecols=needed_columns, engine='calamine')
     variable_names = [str(v) if pd.notnull(v) else '' for v in list(df.columns)]
     units = [str(u) if pd.notnull(u) else '' for u in df.iloc[0].tolist()]
     df_data = df.iloc[1:].reset_index(drop=True)
@@ -133,12 +135,18 @@ def CRS_output(xlsm_paths):
         df.to_excel(output_path, index=False, header=False, engine='openpyxl')
 
 @timing
-def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None):
+def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=True):
     """
     xlsm_paths: list of Excel file paths
+    debug_mode: if True, only engine speed channels are merged
     """
     mdf_orig = MDF(mf4_path)
-    engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed')]
+    engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed1')]
+    if not engspd_channels:
+        engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed')]
+
+    print(f"Found {len(engspd_channels)} engine speed channels in MF4: {engspd_channels}")
+
     if not engspd_channels:
         raise ValueError("No engine_speed channel found in MF4.")
 
@@ -148,95 +156,92 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None):
     mdf = MDF()
     excel_signals_total = 0
 
-    # Add all MF4 channels first (unaligned, will be trimmed later if needed)
-    for name in mdf_orig.channels_db:
-        for group, index in mdf_orig.channels_db[name]:
-            sig = mdf_orig.get(name, group=group, index=index)
-            mdf.append(sig)
+    # Slow! Responsible for 90% of runtime
+    if debug_mode:
+        # Only add engine speed channel
+        group, index = mdf_orig.channels_db[ch_name][0]
+        sig = mdf_orig.get(ch_name, group=group, index=index)
+        mdf.append(sig)
+    else:
+        for name in mdf_orig.channels_db:
+            for group, index in mdf_orig.channels_db[name]:
+                sig = mdf_orig.get(name, group=group, index=index)
+                mdf.append(sig)
 
     for xlsm_path in xlsm_paths:
         df, variable_names, units = read_xlsm_for_merge(xlsm_path)
-        excel_speed_col = next((name for name in variable_names if name.lower() in ['engine speed', 'engine_speed']), None)
-        if not excel_speed_col or excel_speed_col not in df.columns:
-            continue
+        excel_align_col = next((name for name in variable_names if name.lower() in ['engine speed1', 'engine speed', 'engine_speed']), None)
+        if not excel_align_col or excel_align_col not in df.columns:
+            raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid engine speed column.")
 
-        # Get MF4 engine speed and time
-        mf4_speed = engspd.samples
+        mf4_samples = engspd.samples
         mf4_time = engspd.timestamps
-
-        # Get Excel engine speed and time
-        excel_speed = df[excel_speed_col].to_numpy(dtype=float)
+        excel_samples = df[excel_align_col].to_numpy(dtype=float)
         excel_time = df['Test Time'].to_numpy(dtype=float)
+        
+        
+        if np.max(excel_samples) - np.min(excel_samples) < 100:
+            print("Using lambse channel for alignment due to low engine speed range.")
+            lambse_channels = [name for name in variable_names if name.lower().startswith('lambse')]
+            if not lambse_channels:
+                raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid lambse channel.")
+            lambse = mdf_orig.get(lambse_channels[0])
+            mf4_samples = lambse.samples
+            group, index = mdf_orig.channels_db[lambse_channels[0]][0]
+            sig = mdf_orig.get(lambse_channels[0], group=group, index=index)
+            mdf.append(sig)
 
-        # Normalize for cross-correlation
-        excel_speed_norm = (excel_speed - np.mean(excel_speed)) / np.std(excel_speed)
-        mf4_speed_norm = (mf4_speed - np.mean(mf4_speed)) / np.std(mf4_speed)
 
-        # Cross-correlate (allow for any overlap)
-        correlation = np.correlate(mf4_speed_norm, excel_speed_norm, mode='full')
-        lags = np.arange(-len(excel_speed_norm) + 1, len(mf4_speed_norm))
+            excel_align_col = next((name for name in variable_names if name.lower() in ['lambse[0]']), None)
+            excel_samples = df[excel_align_col].to_numpy(dtype=float)
 
-        # Only consider lags where the aligned Excel time overlaps with MF4 time
-        valid_lags = []
-        for i, lag in enumerate(lags):
-            # Calculate the time offset for this lag
-            if lag >= 0:
-                mf4_time_at_lag = mf4_time[lag]
-                excel_time_at_zero = excel_time[0]
-                time_offset = excel_time_at_zero - mf4_time_at_lag
-                # Excel shifted left, must not start before MF4
-                if (excel_time[0] - time_offset) < mf4_time[0]:
-                    continue
-                # Excel shifted right, must not end after MF4
-                if (excel_time[-1] - time_offset) > mf4_time[-1]:
-                    continue
-            else:
-                mf4_time_at_lag = mf4_time[0]
-                excel_time_at_zero = excel_time[-lag]
-                time_offset = excel_time_at_zero - mf4_time_at_lag
-                # Excel shifted left, must not start before MF4
-                if (excel_time[0] - time_offset) < mf4_time[0]:
-                    continue
-                # Excel shifted right, must not end after MF4
-                if (excel_time[-1] - time_offset) > mf4_time[-1]:
-                    continue
-            # Overlap check passed
-            valid_lags.append(i)
-
-        if not valid_lags:
-            raise ValueError("No sufficient overlap between MF4 and Excel engine speed signals.")
-
-        # Find the best lag within valid lags
-        best_idx = valid_lags[np.argmax(correlation[valid_lags])]
-        lag = lags[best_idx]
-
-        # Calculate alignment
+        print(excel_samples)
+        print(mf4_samples)
+        # Interpolate Excel engine speed to MF4 timestamps
+        excel_interp = np.interp(mf4_time, excel_time, excel_samples)
+        print(f"Interpolated {len(excel_interp)} samples from Excel samples.")
+        excel_interp_std = np.std(excel_interp)
+        # if excel_interp_std < 1e-6:
+        #     raise ValueError("Excel engine speed signal is too constant for reliable alignment (std < 1e-6).")
+        excel_interp_norm = (excel_interp - np.mean(excel_interp)) / excel_interp_std
+        mf4_speed_norm = (mf4_samples - np.mean(mf4_samples)) / np.std(mf4_samples)
+        correlation = np.correlate(mf4_speed_norm, excel_interp_norm, mode='full')
+        lag = np.argmax(correlation) - (len(excel_interp_norm) - 1)
         if lag >= 0:
-            mf4_time_at_lag = mf4_time[lag]
-            excel_time_at_zero = excel_time[0]
-            time_offset = excel_time_at_zero - mf4_time_at_lag
+            time_offset = mf4_time[lag] - mf4_time[0]
         else:
-            mf4_time_at_lag = mf4_time[0]
-            excel_time_at_zero = excel_time[-lag]
-            time_offset = excel_time_at_zero - mf4_time_at_lag
+            time_offset = mf4_time[0] - mf4_time[-lag]
+        aligned_excel_time = excel_time + time_offset
 
-        # Now, align Excel signals to MF4 time base
-        for idx, col in enumerate(variable_names):
-            if col == 'Test Time' or col.strip() == '':
-                continue
-            if col in df.columns:
-                samples = df[col].values.astype(float)
-                if not np.isnan(samples).all() and len(samples) > 0:
-                    unit = units[idx] if idx < len(units) else ''
-                    signal = Signal(
-                        samples=samples,
-                        timestamps=excel_time - time_offset,  # align to MF4
-                        name=col,
-                        unit=unit,
-                        comment=''
-                    )
-                    mdf.append(signal)
-                    excel_signals_total += 1
+        # Merge signals
+        if debug_mode:
+            # Only add Excel engine speed signal
+            unit = units[variable_names.index(excel_align_col)] if excel_align_col in variable_names else ""
+            signal = Signal(
+                samples=excel_samples,
+                timestamps=aligned_excel_time,
+                name=excel_align_col if excel_align_col else 'Engine Speed',
+                unit=unit,
+                comment='Excel engine speed'
+            )
+            mdf.append(signal)
+            excel_signals_total += 1
+        else:
+            # Add all Excel signals except 'Test Time'
+            for idx, col in enumerate(variable_names):
+                if col == 'Test Time':
+                    continue
+                samples = df[col].to_numpy(dtype=float)
+                unit = units[idx]
+                signal = Signal(
+                    samples=samples,
+                    timestamps=aligned_excel_time,
+                    name=col,
+                    unit=unit,
+                    comment='Excel signal'
+                )
+                mdf.append(signal)
+                excel_signals_total += 1
 
     folder = os.path.dirname(xlsm_paths[0])
     base = os.path.splitext(os.path.basename(xlsm_paths[0]))[0]
@@ -299,7 +304,7 @@ def threaded_merge(jobs):
             try:
                 output_path, added = merge_xlsm_to_mf4(mf4_path, xlsm_paths)
                 try:
-                    CRS_output(xlsm_paths) # !TODO allow for CRS output for multiple Excel inputs
+                    CRS_output(xlsm_paths)
                 except Exception as e:
                     handle_error(e, xlsm_paths)
                 handle_success(output_path, added)
@@ -318,7 +323,7 @@ root.title("MF4 + Excel Merge and Convert")
 root.geometry("400x600")
 root.resizable(False, True)
 
-icon_path = resource_path(os.path.join("icons", "dumarey_favicon.ico"))
+icon_path = resource_path(os.path.join("xlsx_mdf_converter", "icons", "dumarey_favicon.ico"))
 
 # Fix for PyInstaller: extract icon to temp file if running as executable
 if hasattr(sys, '_MEIPASS'):
@@ -355,11 +360,50 @@ desc_label = ttk.Label(
 desc_label.pack(pady=(0, 20))
 
 label_frame = ttk.LabelFrame(main_frame, text="Queued Tasks")
+label_frame.configure(style="White.TLabelframe")
+style.configure("White.TLabelframe", background="lightgrey")
+style.configure("White.TLabelframe.Label", background="lightgrey")
+
 label_frame.pack(fill='both', expand=True, pady=(0, 10), padx=20)
 
-jobs_label = ttk.Label(label_frame, text="No tasks queued", font=("Segoe UI", 9), foreground="gray")
-jobs_label.pack(pady=(5, 0))
+canvas = tk.Canvas(label_frame, borderwidth=0, highlightthickness=0, height=120, bg="lightgray")
+scrollbar = ttk.Scrollbar(label_frame, orient="vertical", command=canvas.yview)
+scrollable_frame = tk.Frame(canvas, bg="lightgrey")  # Use tk.Frame for easier bg control
 
+def on_frame_configure(event):
+    canvas.configure(scrollregion=canvas.bbox("all"))
+
+scrollable_frame.bind("<Configure>", on_frame_configure)
+
+canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+canvas.configure(yscrollcommand=scrollbar.set)
+
+canvas.pack(side="left", fill="both", expand=True)
+scrollbar.pack(side="right", fill="y")
+
+jobs_label = tk.Label(
+    scrollable_frame,
+    text="No tasks queued",
+    font=("Segoe UI", 9),
+    fg="black",
+    bg="lightgrey",
+    justify="left",
+    anchor="nw"
+)
+jobs_label.pack(pady=(5, 0), anchor="w", fill="x")
+
+def _on_mousewheel(event):
+    # Get current scroll position (returns a tuple of fractions, e.g., (0.0, 1.0) means fully scrolled)
+    first, last = canvas.yview()
+    # Determine scroll direction
+    delta = int(-1*(event.delta/120))
+    # Only scroll up if not at the top, only scroll down if not at the bottom
+    if delta < 0 and first <= 0.0:
+        return  # At the top, don't scroll up
+    if delta > 0 and last >= 1.0:
+        return  # At the bottom, don't scroll down
+    canvas.yview_scroll(delta, "units")
+canvas.bind_all("<MouseWheel>", _on_mousewheel)
 task_btn_frame = ttk.Frame(main_frame)
 task_btn_frame.pack(pady=10)
 
