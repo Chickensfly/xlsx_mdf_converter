@@ -10,7 +10,7 @@ import tempfile
 
 from openpyxl import load_workbook
 from asammdf import MDF, Signal
-from tkinter import Checkbutton, ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 from python_calamine.pandas import pandas_monkeypatch
 
 def resource_path(relative_path):
@@ -21,7 +21,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# List to hold jobs for processing
+# Array to hold jobs for processing
 jobs = []
 
 # For debugging and optimization, define a decorator to time functions
@@ -54,7 +54,7 @@ def add_job():
         jobs.append((None, [xlsm_path]))
     update_jobs_label()
 
-# Updates the jobs readout to reflect current tasks
+# Updates the jobs readout to reflect current tasks, is called after adding/removing jobs
 def update_jobs_label():
     update_text = ""
     for i, (mf4_path, xlsm_paths) in enumerate(jobs):
@@ -67,9 +67,10 @@ def update_jobs_label():
         update_text = "No tasks queued"
     jobs_label.config(text=update_text)
 
+# Reads xlsm file, extracts needed columns, and returns a DataFrame with variable names and units
 @timing
 def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
-    # Check available sheets
+    # Check for data sheets
     xl = pd.ExcelFile(xlsm_path, engine='calamine')
     if 'Uniplot' in xl.sheet_names:
         sheet_to_read = 'Uniplot'
@@ -138,96 +139,157 @@ def CRS_output(xlsm_paths):
 def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=True):
     """
     xlsm_paths: list of Excel file paths
-    debug_mode: if True, only engine speed channels are merged
+    debug_mode: if True, only alignment channels are merged
     """
-    mdf_orig = MDF(mf4_path)
-    engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed1')]
-    if not engspd_channels:
-        engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed')]
-
-    print(f"Found {len(engspd_channels)} engine speed channels in MF4: {engspd_channels}")
-
-    if not engspd_channels:
-        raise ValueError("No engine_speed channel found in MF4.")
-
-    ch_name = engspd_channels[0]
-    engspd = mdf_orig.get(ch_name)
-
     mdf = MDF()
     excel_signals_total = 0
 
-    # Slow! Responsible for 90% of runtime
-    if debug_mode:
-        # Only add engine speed channel
-        group, index = mdf_orig.channels_db[ch_name][0]
-        sig = mdf_orig.get(ch_name, group=group, index=index)
-        mdf.append(sig)
-    else:
-        for name in mdf_orig.channels_db:
-            for group, index in mdf_orig.channels_db[name]:
-                sig = mdf_orig.get(name, group=group, index=index)
-                mdf.append(sig)
+    # If mf4_path is provided, files are merged with Excel files
+    if mf4_path:
+        mdf_orig = MDF(mf4_path)
+        # Initially defaults to engine speed channels for alignment
+        engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed1')]
+        if not engspd_channels:
+            engspd_channels = [ch for ch in mdf_orig.channels_db if ch.lower().startswith('engine_speed')]
 
-    for xlsm_path in xlsm_paths:
-        df, variable_names, units = read_xlsm_for_merge(xlsm_path)
-        excel_align_col = next((name for name in variable_names if name.lower() in ['engine speed1', 'engine speed', 'engine_speed']), None)
-        if not excel_align_col or excel_align_col not in df.columns:
-            raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid engine speed column.")
+        print(f"Found {len(engspd_channels)} engine speed channels in MF4: {engspd_channels}")
 
-        mf4_samples = engspd.samples
-        mf4_time = engspd.timestamps
-        excel_samples = df[excel_align_col].to_numpy(dtype=float)
-        excel_time = df['Test Time'].to_numpy(dtype=float)
-        
-        
-        if np.max(excel_samples) - np.min(excel_samples) < 100:
-            print("Using lambse channel for alignment due to low engine speed range.")
-            lambse_channels = [name for name in variable_names if name.lower().startswith('lambse')]
-            if not lambse_channels:
-                raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid lambse channel.")
-            lambse = mdf_orig.get(lambse_channels[0])
-            mf4_samples = lambse.samples
-            group, index = mdf_orig.channels_db[lambse_channels[0]][0]
-            sig = mdf_orig.get(lambse_channels[0], group=group, index=index)
-            mdf.append(sig)
+        if not engspd_channels:
+            raise ValueError("No engine_speed channel found in MF4.")
 
+        ch_name = engspd_channels[0]
+        engspd = mdf_orig.get(ch_name)
 
-            excel_align_col = next((name for name in variable_names if name.lower() in ['lambse[0]']), None)
-            excel_samples = df[excel_align_col].to_numpy(dtype=float)
-
-        print(excel_samples)
-        print(mf4_samples)
-        # Interpolate Excel engine speed to MF4 timestamps
-        excel_interp = np.interp(mf4_time, excel_time, excel_samples)
-        print(f"Interpolated {len(excel_interp)} samples from Excel samples.")
-        excel_interp_std = np.std(excel_interp)
-        # if excel_interp_std < 1e-6:
-        #     raise ValueError("Excel engine speed signal is too constant for reliable alignment (std < 1e-6).")
-        excel_interp_norm = (excel_interp - np.mean(excel_interp)) / excel_interp_std
-        mf4_speed_norm = (mf4_samples - np.mean(mf4_samples)) / np.std(mf4_samples)
-        correlation = np.correlate(mf4_speed_norm, excel_interp_norm, mode='full')
-        lag = np.argmax(correlation) - (len(excel_interp_norm) - 1)
-        if lag >= 0:
-            time_offset = mf4_time[lag] - mf4_time[0]
-        else:
-            time_offset = mf4_time[0] - mf4_time[-lag]
-        aligned_excel_time = excel_time + time_offset
-
-        # Merge signals
         if debug_mode:
-            # Only add Excel engine speed signal
-            unit = units[variable_names.index(excel_align_col)] if excel_align_col in variable_names else ""
-            signal = Signal(
-                samples=excel_samples,
-                timestamps=aligned_excel_time,
-                name=excel_align_col if excel_align_col else 'Engine Speed',
-                unit=unit,
-                comment='Excel engine speed'
-            )
-            mdf.append(signal)
-            excel_signals_total += 1
+            # Only add engine speed channel
+            group, index = mdf_orig.channels_db[ch_name][0]
+            sig = mdf_orig.get(ch_name, group=group, index=index)
+            mdf.append(sig)
         else:
-            # Add all Excel signals except 'Test Time'
+            # Slow! Responsible for 90% of runtime
+            for name in mdf_orig.channels_db:
+                for group, index in mdf_orig.channels_db[name]:
+                    sig = mdf_orig.get(name, group=group, index=index)
+                    mdf.append(sig)
+
+        for xlsm_path in xlsm_paths:
+            df, variable_names, units = read_xlsm_for_merge(xlsm_path)
+            excel_align_col = next((name for name in variable_names if name.lower() in ['engine speed1', 'engine speed', 'engine_speed']), None)
+            if not excel_align_col or excel_align_col not in df.columns:
+                raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid engine speed column.")
+
+            mf4_samples = engspd.samples
+            mf4_time = engspd.timestamps
+            excel_samples = df[excel_align_col].to_numpy(dtype=float)
+            excel_time = df['Test Time'].to_numpy(dtype=float)
+
+            print(f"MF4 time range: {mf4_time[0]:.2f} to {mf4_time[-1]:.2f} (duration: {mf4_time[-1] - mf4_time[0]:.2f}s)")
+            print(f"Excel time range: {excel_time[0]:.2f} to {excel_time[-1]:.2f} (duration: {excel_time[-1] - excel_time[0]:.2f}s)")
+
+            # If engine speed has low variance, instead default to lambse_tgt channel for alignment
+            if is_signal_consistent(excel_samples):
+                print("Using LAMBSE channel for alignment due to low engine speed variance.")
+                lambse_channels = [name for name in variable_names if name.lower().startswith('lambse_tgt')]
+                if not lambse_channels:
+                    raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid LAMBSE channel for alignment.")
+                
+                # Check if LAMBSE channel exists in MF4
+                mf4_lambse_name = lambse_channels[0]
+                if mf4_lambse_name not in mdf_orig.channels_db:
+                    raise ValueError(f"Channel '{mf4_lambse_name}' not found in MF4 file for alignment.")
+                
+                lambse = mdf_orig.get(mf4_lambse_name)
+                mf4_samples = lambse.samples
+                mf4_time = lambse.timestamps
+
+                group, index = mdf_orig.channels_db[mf4_lambse_name][0]
+                sig = mdf_orig.get(mf4_lambse_name, group=group, index=index)
+                mdf.append(sig)
+                
+                excel_align_col = next((name for name in variable_names if name.lower() in ['lambse_tgt[0]']), mf4_lambse_name)
+                if excel_align_col not in df.columns:
+                    raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid LAMBSE alignment column like '{excel_align_col}'.")
+                excel_samples = df[excel_align_col].to_numpy(dtype=float)
+
+            # Determine a common, uniform sample rate
+            mf4_rate = 1 / np.mean(np.diff(mf4_time))
+            excel_rate = 1 / np.mean(np.diff(excel_time))
+            target_rate = min(mf4_rate, excel_rate)
+            sample_time = 1 / target_rate
+            print(f"Resampling signals to a common rate of {target_rate:.2f} Hz.")
+
+            # Create a new uniform time grid for the longer signal (Excel)
+            excel_duration = excel_time[-1] - excel_time[0]
+            num_excel_samples_uniform = int(excel_duration * target_rate) + 1
+            excel_time_uniform_relative = np.linspace(0, excel_duration, num_excel_samples_uniform)
+            excel_samples_uniform = np.interp(excel_time_uniform_relative, excel_time - excel_time[0], excel_samples)
+
+            # Resample the shorter signal (MF4) to the same rate, but keep its original duration
+            mf4_duration = mf4_time[-1] - mf4_time[0]
+            num_mf4_samples_uniform = int(mf4_duration * target_rate) + 1
+            mf4_time_uniform_relative = np.linspace(0, mf4_duration, num_mf4_samples_uniform)
+            mf4_samples_uniform = np.interp(mf4_time_uniform_relative, mf4_time - mf4_time[0], mf4_samples)
+
+            # Normalize signals and perform correlation
+            excel_norm = (excel_samples_uniform - np.mean(excel_samples_uniform)) / np.std(excel_samples_uniform)
+            mf4_norm = (mf4_samples_uniform - np.mean(mf4_samples_uniform)) / np.std(mf4_samples_uniform)
+            
+            # Correlate the shorter MF4 signal against the longer Excel signal
+            correlation = np.correlate(excel_norm, mf4_norm, mode='full')
+            correlation = correlation / max(np.abs(correlation))  # Normalize correlation
+
+            # Calculate lag and time offset
+            lag_index = np.argmax(correlation)
+            # Adjust lag for 'full' correlation mode
+            lag_in_samples = lag_index - (len(mf4_norm) - 1)
+
+            time_offset_seconds = lag_in_samples * sample_time
+            
+            # The offset needed to align Excel's relative time to the MF4's absolute time
+            time_offset = mf4_time[0] - (excel_time[0] + time_offset_seconds)
+            
+            print(f"Max correlation: {np.max(correlation):.4f}")
+            print(f"Detected lag of {time_offset_seconds:.2f} seconds in Excel data.")
+            print(f"Calculated time offset: {time_offset:.2f}s")
+
+            aligned_excel_time = excel_time + time_offset
+
+            # Merge signals
+            if debug_mode:
+                # Only add Excel alignment signal
+                unit = units[variable_names.index(excel_align_col)] if excel_align_col in variable_names else ""
+                signal = Signal(
+                    samples=excel_samples,
+                    timestamps=aligned_excel_time,
+                    name=excel_align_col if excel_align_col else 'Engine Speed',
+                    unit=unit,
+                    comment='Alignment Variable'
+                )
+                mdf.append(signal)
+                excel_signals_total += 1
+            else:
+                # Add all Excel signals except 'Test Time'
+                for idx, col in enumerate(variable_names):
+                    if col == 'Test Time':
+                        continue
+                    samples = df[col].to_numpy(dtype=float)
+                    unit = units[idx]
+                    signal = Signal(
+                        samples=samples,
+                        timestamps=aligned_excel_time,
+                        name=col,
+                        unit=unit,
+                        comment='Excel signal'
+                    )
+                    mdf.append(signal)
+                    excel_signals_total += 1
+    else:
+        # No MF4 file, just convert Excel file
+        for xlsm_path in xlsm_paths:
+            df, variable_names, units = read_xlsm_for_merge(xlsm_path)
+            if 'Test Time' not in variable_names:
+                raise ValueError(f"The '{xlsm_path}' file must contain a 'Test Time' column.")
+            aligned_excel_time = df['Test Time'].to_numpy(dtype=float)
             for idx, col in enumerate(variable_names):
                 if col == 'Test Time':
                     continue
@@ -245,7 +307,10 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
 
     folder = os.path.dirname(xlsm_paths[0])
     base = os.path.splitext(os.path.basename(xlsm_paths[0]))[0]
-    output_path = os.path.join(folder, base + "_merged.mf4")
+    if mf4_path:
+        output_path = os.path.join(folder, base + "_merged.mf4")
+    else:
+        output_path = os.path.join(folder, base + "_converted.mf4")
     mdf.save(output_path, compression=1)
     return output_path, excel_signals_total
 
@@ -317,6 +382,14 @@ def threaded_merge(jobs):
     root.after(0, prepare_progress)
     threading.Thread(target=run_merge, daemon=True).start()
 
+# Calculates coefficient of variation (CV) to determine if a signal is consistent
+def is_signal_consistent(data):
+    cv = np.std(data) / np.mean(data) 
+    threshold = 0.01
+    if cv < threshold:
+        print(cv, "CV is low, signal is consistent")
+        return True
+    return False
 
 root = tk.Tk()
 root.title("MF4 + Excel Merge and Convert")
@@ -395,13 +468,11 @@ jobs_label.pack(pady=(5, 0), anchor="w", fill="x")
 def _on_mousewheel(event):
     # Get current scroll position (returns a tuple of fractions, e.g., (0.0, 1.0) means fully scrolled)
     first, last = canvas.yview()
-    # Determine scroll direction
     delta = int(-1*(event.delta/120))
-    # Only scroll up if not at the top, only scroll down if not at the bottom
     if delta < 0 and first <= 0.0:
-        return  # At the top, don't scroll up
+        return  
     if delta > 0 and last >= 1.0:
-        return  # At the bottom, don't scroll down
+        return
     canvas.yview_scroll(delta, "units")
 canvas.bind_all("<MouseWheel>", _on_mousewheel)
 task_btn_frame = ttk.Frame(main_frame)
