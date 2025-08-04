@@ -13,10 +13,22 @@ from asammdf import MDF, Signal
 from tkinter import ttk, filedialog, messagebox
 from python_calamine.pandas import pandas_monkeypatch
 
+"""
+Dumarey MF4/Excel Merge and Convert Tool
+Last Updated 8/4/2025
+Written by Jeffrey Liu
+
+Merges MF4 files with Excel files, outputting a single MF4 file with all signals present and time-aligned.
+Additionally, if there is a summary sheet in the Excel file, the values will be extracted and saved as a new Excel file.
+This program is designed to accept a queue of jobs to process in the background, requiring minimal user interaction.
+One MF4 file can be merged with multiple Excel files or Excel files can be converted to MF4. 
+Time-alignment is done using ENGINE SPEED channels. If they are very consistent, LAMBSE channels are used instead.
+"""
+
 def resource_path(relative_path):
     # PyInstaller creates a temp folder and stores path in _MEIPASS
     if hasattr(sys, '_MEIPASS'):
-        base_path = sys._MEIPASS
+        base_path = sys._MEIPASS # type: ignore
     else:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
@@ -34,29 +46,43 @@ def timing(func):
         return result
     return wrapper
 
+last_mf4_path = "/"
+last_excel_path = "/"
 # Asks user to select files for input, returns a tuple of (mf4_path, xlsm_path)
 def add_job():
+    global last_mf4_path, last_excel_path, jobs
+
     mf4_path = filedialog.askopenfilename(
             title="Select MF4 File (Cancel to create new from Excel)",
+            initialdir=last_mf4_path,
             filetypes=[("MF4 files", "*.mf4"), ("All files", "*.*")]
         )
+    last_mf4_path = "/".join(mf4_path.split("/")[:-1]) if mf4_path else None
+    if last_excel_path == "/":
+        last_excel_path = last_mf4_path
+    print(last_mf4_path)
     if mf4_path:
         xlsm_paths = filedialog.askopenfilenames(
             title="Select Excel Files",
+            initialdir=last_excel_path,
             filetypes=[("Excel Macro-enabled files", "*.xlsm"), ("Excel files", "*.xlsx"), ("All files", "*.*")]
         )
+        last_excel_path = "/".join(xlsm_paths[0].split("/")[:-1]) if xlsm_paths else None
+        print(last_excel_path)
         jobs.append((mf4_path, list(xlsm_paths)))
     else:
         xlsm_path = filedialog.askopenfilename(
             title="Select Excel File",
+            initialdir=last_excel_path,
             filetypes=[("Excel Macro-enabled files", "*.xlsm"), ("Excel files", "*.xlsx"), ("All files", "*.*")]
         )
         jobs.append((None, [xlsm_path]))
+     
     update_jobs_label()
 
 # Updates the jobs readout to reflect current tasks, is called after adding/removing jobs
 def update_jobs_label():
-    update_text = ""
+    update_text = "" # Blank string that is appended upon
     for i, (mf4_path, xlsm_paths) in enumerate(jobs):
         update_text += f"Job {i + 1}:\n"
         if mf4_path:
@@ -65,7 +91,7 @@ def update_jobs_label():
             update_text += f"   Excel {idx+1}: {os.path.basename(xlsm_path)}\n"
     if not update_text:
         update_text = "No tasks queued"
-    jobs_label.config(text=update_text)
+    jobs_label.config(text=update_text) # Update text is applied to the label
 
 # Reads xlsm file, extracts needed columns, and returns a DataFrame with variable names and units
 @timing
@@ -94,11 +120,20 @@ def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
     df = pd.read_excel(xlsm_path, sheet_name=sheet_to_read, usecols=needed_columns, engine='calamine')
     variable_names = [str(v) if pd.notnull(v) else '' for v in list(df.columns)]
     units = [str(u) if pd.notnull(u) else '' for u in df.iloc[0].tolist()]
+
     df_data = df.iloc[1:].reset_index(drop=True)
     df_data.columns = variable_names
 
     if 'Test Time' not in variable_names:
         raise ValueError(f"The '{sheet_to_read}' sheet must contain a 'Test Time' column.")
+
+    # Drops the first x rows of Test Time that are empty
+    test_time_idx = df_data.columns.get_loc('Test Time')
+    while pd.isnull(df_data.iloc[0, test_time_idx]): #type: ignore
+        print(f"Removing empty header row in '{sheet_to_read}' sheet.")
+        df_data = df_data.iloc[1:].reset_index(drop=True)
+        if df_data.empty:
+            raise ValueError(f"The '{sheet_to_read}' sheet does not contain valid data after the header.")
 
     # Convert all columns except 'Test Time' to numeric
     for col in df_data.columns:
@@ -123,7 +158,7 @@ def read_xlsm_for_merge(xlsm_path, mdf_orig=None):
 @timing
 def CRS_output(xlsm_paths):
     for sheet in xlsm_paths:
-        wb = load_workbook(sheet, read_only=True, data_only=True)
+        wb = load_workbook(sheet, read_only=True, data_only=True) # Reads workbook, only data (no macros)
         if 'Cumulatives' in wb.sheetnames:
             ws = wb['Cumulatives']
             data = []
@@ -135,12 +170,15 @@ def CRS_output(xlsm_paths):
         output_path = os.path.splitext(sheet)[0] + '_summary.xlsx'
         df.to_excel(output_path, index=False, header=False, engine='openpyxl')
 
+# Brunt of the merging logic
 @timing
-def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=True):
+def merge_xlsm_to_mf4(mf4_path, xlsm_paths, debug_mode=False):
     """
+    mf4_path: path to the MF4 file, optional and can be None to instead convert Excel files
     xlsm_paths: list of Excel file paths
-    debug_mode: if True, only alignment channels are merged
+    debug_mode: if True, only alignment channels are merged, valuable to save time during testing
     """
+    progress['value'] = 0
     mdf = MDF()
     excel_signals_total = 0
 
@@ -167,28 +205,30 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
             mdf.append(sig)
         else:
             # Slow! Responsible for 90% of runtime
+            # Iterate through all channels in the MF4 file and append them to the MDF object
             for name in mdf_orig.channels_db:
                 for group, index in mdf_orig.channels_db[name]:
                     sig = mdf_orig.get(name, group=group, index=index)
                     mdf.append(sig)
+                progress.step(50/(len(mdf_orig.channels_db)))
+                
 
         for xlsm_path in xlsm_paths:
             df, variable_names, units = read_xlsm_for_merge(xlsm_path)
+            progress.step(20/len(xlsm_paths))
+            # Get engine speed column from Excel for alignment
             excel_align_col = next((name for name in variable_names if name.lower() in ['engine speed1', 'engine speed', 'engine_speed']), None)
             if not excel_align_col or excel_align_col not in df.columns:
                 raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid engine speed column.")
 
             mf4_samples = engspd.samples
             mf4_time = engspd.timestamps
+
             excel_samples = df[excel_align_col].to_numpy(dtype=float)
             excel_time = df['Test Time'].to_numpy(dtype=float)
 
-            print(f"MF4 time range: {mf4_time[0]:.2f} to {mf4_time[-1]:.2f} (duration: {mf4_time[-1] - mf4_time[0]:.2f}s)")
-            print(f"Excel time range: {excel_time[0]:.2f} to {excel_time[-1]:.2f} (duration: {excel_time[-1] - excel_time[0]:.2f}s)")
-
             # If engine speed has low variance, instead default to lambse_tgt channel for alignment
             if is_signal_consistent(excel_samples):
-                print("Using LAMBSE channel for alignment due to low engine speed variance.")
                 lambse_channels = [name for name in variable_names if name.lower().startswith('lambse_tgt')]
                 if not lambse_channels:
                     raise ValueError(f"Excel file '{xlsm_path}' does not contain a valid LAMBSE channel for alignment.")
@@ -214,7 +254,7 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
             # Determine a common, uniform sample rate
             mf4_rate = 1 / np.mean(np.diff(mf4_time))
             excel_rate = 1 / np.mean(np.diff(excel_time))
-            target_rate = min(mf4_rate, excel_rate)
+            target_rate = min(mf4_rate, excel_rate) # type: ignore
             sample_time = 1 / target_rate
             print(f"Resampling signals to a common rate of {target_rate:.2f} Hz.")
 
@@ -248,7 +288,6 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
             # The offset needed to align Excel's relative time to the MF4's absolute time
             time_offset = mf4_time[0] - (excel_time[0] + time_offset_seconds)
             
-            print(f"Max correlation: {np.max(correlation):.4f}")
             print(f"Detected lag of {time_offset_seconds:.2f} seconds in Excel data.")
             print(f"Calculated time offset: {time_offset:.2f}s")
 
@@ -283,10 +322,12 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
                     )
                     mdf.append(signal)
                     excel_signals_total += 1
+                    progress.step(29/(len(variable_names)*len(xlsm_paths)))
     else:
         # No MF4 file, just convert Excel file
         for xlsm_path in xlsm_paths:
             df, variable_names, units = read_xlsm_for_merge(xlsm_path)
+            progress.step(20/len(xlsm_paths))
             if 'Test Time' not in variable_names:
                 raise ValueError(f"The '{xlsm_path}' file must contain a 'Test Time' column.")
             aligned_excel_time = df['Test Time'].to_numpy(dtype=float)
@@ -304,6 +345,7 @@ def merge_xlsm_to_mf4(mf4_path, xlsm_paths, progress_callback=None, debug_mode=T
                 )
                 mdf.append(signal)
                 excel_signals_total += 1
+                progress.step(79/(len(variable_names)*len(xlsm_paths)))
 
     folder = os.path.dirname(xlsm_paths[0])
     base = os.path.splitext(os.path.basename(xlsm_paths[0]))[0]
@@ -336,7 +378,6 @@ def threaded_merge(jobs):
         task_btn_frame.pack_forget()
         convert_btn.pack_forget()
         progress.pack()
-        progress.start(10)
     
     def show_results():
         progress.stop()
@@ -391,6 +432,16 @@ def is_signal_consistent(data):
         return True
     return False
 
+"""
+Below is the main GUI setup, using Tkinter and ttk for styling.
+
+main_frame is the container for all widgets.
+title_label displays the bolded title text.
+desc_label provides subtitle text with brief instructions.
+label_frame is a scrollable frame for queued tasks, displaying current jobs.
+add_task_btn and undo_task_btn are buttons to add or remove jobs.
+convert_btn starts the merge and convert process.
+"""
 root = tk.Tk()
 root.title("MF4 + Excel Merge and Convert")
 root.geometry("400x600")
@@ -398,7 +449,7 @@ root.resizable(False, True)
 
 icon_path = resource_path(os.path.join("xlsx_mdf_converter", "icons", "dumarey_favicon.ico"))
 
-# Fix for PyInstaller: extract icon to temp file if running as executable
+# Gets the icon for the application, handles PyInstaller packaging
 if hasattr(sys, '_MEIPASS'):
     temp_icon = tempfile.NamedTemporaryFile(delete=False, suffix='.ico')
     shutil.copyfile(icon_path, temp_icon.name)
@@ -465,6 +516,7 @@ jobs_label = tk.Label(
 )
 jobs_label.pack(pady=(5, 0), anchor="w", fill="x")
 
+# Implements scrolling behavior of the label frame
 def _on_mousewheel(event):
     # Get current scroll position (returns a tuple of fractions, e.g., (0.0, 1.0) means fully scrolled)
     first, last = canvas.yview()
@@ -474,6 +526,7 @@ def _on_mousewheel(event):
     if delta > 0 and last >= 1.0:
         return
     canvas.yview_scroll(delta, "units")
+
 canvas.bind_all("<MouseWheel>", _on_mousewheel)
 task_btn_frame = ttk.Frame(main_frame)
 task_btn_frame.pack(pady=10)
@@ -489,7 +542,7 @@ undo_task_btn.pack(side='left')
 convert_btn = ttk.Button(main_frame, text="Merge and Convert", command=lambda: threaded_merge(jobs), style="Green.TButton")
 convert_btn.pack(pady=10)
 
-progress = ttk.Progressbar(main_frame, mode='indeterminate', length=250)
+progress = ttk.Progressbar(main_frame, mode='determinate', length=250)
 progress.pack(pady=10)
 progress.pack_forget()
 
