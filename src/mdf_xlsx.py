@@ -2,6 +2,7 @@ import sys
 import os
 import tkinter as tk
 import threading
+from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
 import time
@@ -11,6 +12,7 @@ import tempfile
 from openpyxl import load_workbook
 from asammdf import MDF, Signal
 from tkinter import ttk, filedialog, messagebox
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from python_calamine.pandas import pandas_monkeypatch
 
 """
@@ -60,7 +62,6 @@ def add_job():
     last_mf4_path = "/".join(mf4_path.split("/")[:-1]) if mf4_path else None
     if last_excel_path == "/":
         last_excel_path = last_mf4_path
-    print(last_mf4_path)
     if mf4_path:
         xlsm_paths = filedialog.askopenfilenames(
             title="Select Excel Files",
@@ -68,7 +69,6 @@ def add_job():
             filetypes=[("Excel Macro-enabled files", "*.xlsm"), ("Excel files", "*.xlsx"), ("All files", "*.*")]
         )
         last_excel_path = "/".join(xlsm_paths[0].split("/")[:-1]) if xlsm_paths else None
-        print(last_excel_path)
         jobs.append((mf4_path, list(xlsm_paths)))
     else:
         xlsm_path = filedialog.askopenfilename(
@@ -366,10 +366,12 @@ def remove_job():
 # Tkinter GUI Handling
 def threaded_merge(jobs):
     successes = []
+    merged_files = []
     errors = []
 
     def handle_success(output_path, added):
         successes.append((output_path, added))
+        merged_files.append(output_path)
 
     def handle_error(e, xlsm_path):
         errors.append((e, xlsm_path))
@@ -400,8 +402,53 @@ def threaded_merge(jobs):
                     excel_files = os.path.basename(xlsm_path)
                 results += f"Error: {error}\nExcel File: {excel_files}\n"
                 # ...existing code...
-        messagebox.showinfo("Results", results)
+        response = messagebox.askyesno("Results", results + "\n\nDo you want to plot the results to verify?")
+        if response:
+            plot_results()
         jobs_label.config(text="No tasks queued")
+
+    def plot_results():
+        plot_window = tk.Toplevel(root)
+        plot_window.title("Data Visualization")
+        plot_window.geometry("800x600")
+        
+        # Create a notebook for tabbed plots
+        notebook = ttk.Notebook(plot_window)
+        notebook.pack(fill='both', expand=True)
+        
+        for i, file in enumerate(merged_files):
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text=os.path.basename(file))
+            
+            mdf = MDF(file)
+            fig = plt.figure(figsize=(8, 6))
+            ax = fig.add_subplot(111)
+            
+            if 'Engine Speed' in mdf.channels_db:
+                pairs = mdf.channels_db['Engine Speed']
+                for group, index in pairs:
+                    signal = mdf.get('Engine Speed', group=group, index=index)
+                    ax.plot(signal.timestamps, signal.samples, label='Engine Speed')
+            if 'ENGINE_SPEED' in mdf.channels_db:
+                pairs = mdf.channels_db['ENGINE_SPEED']
+                for group, index in pairs:
+                    signal = mdf.get('ENGINE_SPEED', group=group, index=index)
+                    ax.plot(signal.timestamps, signal.samples, label='ENGINE_SPEED')
+                    
+            ax.set_title(f"{os.path.basename(file)}")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("RPM")
+            ax.legend()
+            
+            # Embed the plot in the Tkinter window
+            canvas = FigureCanvasTkAgg(fig, master=frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+        # This keeps the plot window tied to the main Tkinter window
+        plot_window.transient(root)
+        plot_window.grab_set()
+        root.wait_window(plot_window)
 
     @timing
     def run_merge():
@@ -485,14 +532,14 @@ desc_label.pack(pady=(0, 20))
 
 label_frame = ttk.LabelFrame(main_frame, text="Queued Tasks")
 label_frame.configure(style="White.TLabelframe")
-style.configure("White.TLabelframe", background="lightgrey")
-style.configure("White.TLabelframe.Label", background="lightgrey")
+style.configure("White.TLabelframe", background="#d9d9d9")
+style.configure("White.TLabelframe.Label", background="#d9d9d9")
 
 label_frame.pack(fill='both', expand=True, pady=(0, 10), padx=20)
 
-canvas = tk.Canvas(label_frame, borderwidth=0, highlightthickness=0, height=120, bg="lightgray")
+canvas = tk.Canvas(label_frame, borderwidth=0, highlightthickness=0, height=120, bg="#d9d9d9")
 scrollbar = ttk.Scrollbar(label_frame, orient="vertical", command=canvas.yview)
-scrollable_frame = tk.Frame(canvas, bg="lightgrey")  # Use tk.Frame for easier bg control
+scrollable_frame = tk.Frame(canvas, bg="#d9d9d9")  # Use tk.Frame for easier bg control
 
 def on_frame_configure(event):
     canvas.configure(scrollregion=canvas.bbox("all"))
@@ -510,7 +557,7 @@ jobs_label = tk.Label(
     text="No tasks queued",
     font=("Segoe UI", 9),
     fg="black",
-    bg="lightgrey",
+    bg="#d9d9d9",
     justify="left",
     anchor="nw"
 )
@@ -550,4 +597,11 @@ status_var = tk.StringVar()
 status_label = ttk.Label(main_frame, textvariable=status_var, font=("Segoe UI", 9), foreground="gray")
 status_label.pack(pady=(5, 0))
 
+def on_closing():
+    """Handles the window closing event to prevent shutdown errors."""
+    plt.close('all') 
+    root.quit()       
+    root.destroy()    
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
 root.mainloop()
