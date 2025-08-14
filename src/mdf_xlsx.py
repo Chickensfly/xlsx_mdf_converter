@@ -17,7 +17,7 @@ from python_calamine.pandas import pandas_monkeypatch
 
 """
 Dumarey MF4/Excel Merge and Convert Tool
-Last Updated 8/4/2025
+Last Updated 8/11/2025
 Written by Jeffrey Liu
 
 Merges MF4 files with Excel files, outputting a single MF4 file with all signals present and time-aligned.
